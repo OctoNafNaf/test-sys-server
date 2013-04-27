@@ -1,6 +1,7 @@
-#include <bufstring.h>
 #include <string.h>
 #include <stdlib.h>
+
+#include "bufstring.h"
 
 string string_start()
 {

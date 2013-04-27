@@ -9,34 +9,17 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <pthread.h>
+#include <errno.h>
 
-#include <bufstring.h>
+#include "bufstring.h"
+#include "core-server.h"
 
+#define MAX_HEADERS 50
 #define BUFSIZE 4096
-
-enum http_method
-{
-    GET,
-    POST,
-    UNKNOWN,
-};
-
-char *http_method_name[] = 
-{
-    [GET]       "GET",
-    [POST]      "POST",
-    [UNKNOWN]   "",
-};
-
-typedef struct http_header http_header;
-
-struct http_header
-{
-    int content_length, method;
-};
 
 int validpath(char *path)
 {
@@ -62,7 +45,7 @@ int validpath(char *path)
 
 char *getstr(int sockfd)
 {
-    char c;
+    char c = -1;
     string s = string_start();
     while(1) {
         int rd = read(sockfd, &c, 1);
@@ -70,10 +53,12 @@ char *getstr(int sockfd)
             break;
         string_add_char(&s, c);
     }
+    if (c == '\r')
+        read(sockfd, &c, 1);
     return string_finish(&s, NULL);
 }
 
-char *getheader(int sockfd)
+char *getstrline(int sockfd)
 {
     char c, last = -1;
     string s = string_start();
@@ -88,58 +73,160 @@ char *getheader(int sockfd)
     return string_finish(&s, NULL);
 }
 
-void process_header(char *header, http_header *header_info)
+char *getstrlinecrlf(int sockfd)
 {
-    char *colon = strchr(header, ':'), *buf;
+    char c;
+    string s = string_start();
+    while(1) {
+        int rd = read(sockfd, &c, 1);
+        if (!rd)
+            break;
+        string_add_char(&s, c);
+        if (c == '\n')
+            break;
+    }
+    return string_finish(&s, NULL);
+}
+
+void process_header(char *header, header_key_val *kv)
+{
+    char *colon = strchr(header, ':');
     if (colon == NULL)
         return;
     *colon++ = 0;
-    if (strcasecmp("Content-Length", header) == 0)
+    kv->key = strdup(header);
+    kv->value = strdup(colon + 1);
+}
+
+char* getboundary(http_header *header)
+{
+    int i;
+    char *boundary = NULL;
+    for(i = 0; i < header->count; i++)
+        if (strcasecmp("Content-Type", header->headers[i].key) == 0)
+        {
+            char *pos = strcasestr(header->headers[i].value, "boundary");
+            sscanf(pos + 9, "%m[^ ]", &boundary);
+            break;
+        }
+    return boundary;
+}
+
+void readheaders(int sockfd, http_header *header)
+{
+    char *method = getstr(sockfd);
+    
+    if (strcasecmp("GET", method) == 0)
+        header->method = GET;
+    else if (strcasecmp("POST", method) == 0)
+        header->method = POST;
+    else
+        header->method = UNKNOWN;
+        
+    header->uri = getstr(sockfd);
+    header->version = getstr(sockfd);
+    
+    free(method);
+    
+    header->count = 0;
+    header->headers = malloc(MAX_HEADERS * sizeof(header_key_val));
+    while(1)
     {
-        unsigned sz;
-        sscanf(colon, "%d", &sz);
-        asprintf(&buf, "%d", sz);
-        putenv(concat("CONTENT_LENGTH=", buf));
-        free(buf);
+        if (header->count == MAX_HEADERS)
+        {
+            break;
+            printf("TOO MANY HEADERS");
+        }
+        char *s = getstrline(sockfd);
+        if (strcmp("", s) == 0)
+        {
+            free(s);
+            break;
+        }
+        process_header(s, &header->headers[header->count++]);
+        free(s);
     }
 }
 
-void readheaders(int sockfd, http_header *header_info)
+// TODO free(fname)
+char* savepostdata(int sockfd, http_header *header)
 {
-    char *method, *uri, *version;
-    method = getstr(sockfd);
-    
-    if (strcasecmp("GET", method) == 0)
-        header_info->method = GET;
-    else if (strcasecmp("POST", method) == 0)
-        header_info->method = POST;
-    else
-        header_info->method = UNKNOWN;
-    
-    uri = getstr(sockfd);
-    version = getstr(sockfd);
-    
-    printf("%s\n%s\n%s\n", method, uri, version);
-    
-    (void)method;
-    (void)uri;
-    (void)version;
-    
+    char *boundary = getboundary(header);
+    char *tmp = getstrlinecrlf(sockfd);
+    char *filename;
+    header_key_val cur_header;
     while(1)
     {
-        char *header = getheader(sockfd);
-        if (strcmp("", header) == 0)
+        tmp = getstrline(sockfd);
+        if (strcmp("", tmp) == 0)
         {
-            free(header);
+            free(tmp);
             break;
         }
-        printf("HEADER$ %s\n", header);
-        process_header(header, header_info);
-        free(header);
+        process_header(tmp, &cur_header);
+        if (strcasecmp("Content-Disposition", cur_header.key) == 0)
+        {
+            char *fname = strcasestr(cur_header.value, "filename");
+            sscanf(fname + 10, "%m[^\"]", &filename);
+        }
+        free(tmp);
+        free(cur_header.key);
+        free(cur_header.value);
     }
+    int c = mkdir("solutions", 0777);
+    if (c == 0 || (c == -1 && errno == EEXIST))
+    {
+        char *dir = concat("solutions/", filename);
+        FILE *file = fopen(dir, "w");
+        int flag = 1;
+        while(flag)
+        {
+            tmp = getstrlinecrlf(sockfd);
+            if (strstr(tmp, boundary))
+                flag = 0;
+            else
+                fwrite(tmp, sizeof(char), strlen(tmp), file);
+            free(tmp);
+        }
+        fclose(file);
+        struct stat st;
+        stat(dir, &st);
+        truncate(dir, st.st_size - 2);
+        free(dir);
+    }
+    return filename;
 }
 
 const char *response = "<html><h1>SURPRISE MOTHERFUCKA</h1></html>\r\n";
+
+void send_static_html(int sockfd, char *filepath)
+{
+
+    FILE *page = fopen(filepath, "r");
+    if (!page)
+    {
+        dprintf(sockfd, "HTTP/1.1 404 NOT FOUND\r\n");
+        dprintf(sockfd, "Connection: close\r\n");
+        dprintf(sockfd, "Content-Type: text/html; charset=utf-8\r\n");
+        dprintf(sockfd, "\r\n");
+        dprintf(sockfd, "<html><h1>404 - FILE NOT FOUND <br>SURPRISE MOTHERFUCKA</h1></html>\r\n");
+        return;
+    }
+    
+    dprintf(sockfd, "HTTP/1.1 200 OK\r\n");
+    dprintf(sockfd, "Connection: close\r\n");
+    dprintf(sockfd, "Content-Type: text/html; charset=utf-8\r\n");
+    dprintf(sockfd, "\r\n");
+
+    char buffer[BUFSIZE];
+    while (1) {
+        int got = fread(buffer, sizeof(char), BUFSIZE, page);
+        write(sockfd, buffer, got);
+        if (got < BUFSIZE)
+            break;
+    }
+    fclose(page);
+}
 
 void* process_socket(void *ptr)
 {
@@ -148,15 +235,28 @@ void* process_socket(void *ptr)
     http_header header_info;
     
     readheaders(sockfd, &header_info);
+    
+    if (header_info.method == POST)
+        savepostdata(sockfd, &header_info);
+    
+    /*
+    int i;
+    for(i = 0; i < header_info.count; i++)
+        printf("Header [%d]\t\t%s: %s\n", i + 1, header_info.headers[i].key, header_info.headers[i].value);
+    */
     printf("Headers successfuly read\n");
     
     shutdown(sockfd, SHUT_RD);
     
+    /*
     dprintf(sockfd, "HTTP/1.1 200 OK\r\n");
     dprintf(sockfd, "Content-Length: %d\r\n", strlen(response));
     dprintf(sockfd, "Connection: close\r\n");
     dprintf(sockfd, "\r\n");
     dprintf(sockfd, "%s", response);
+    * */
+    
+    send_static_html(sockfd, "static/file-post-form.html");
     
     shutdown(sockfd, SHUT_RDWR);
     close(sockfd);
@@ -179,16 +279,8 @@ int main(int argc, char *argv[])
     bind(server, (struct sockaddr *) &address, sizeof(address));
     listen(server, 1024);
     signal(SIGCHLD, SIG_IGN);
-    
-    struct timeval tv;
-
-    
-    
     while (1) {
         client = accept(server, (struct sockaddr *)&address, &addrlen);
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(struct timeval));
         pthread_t thread;
         if (pthread_create(&thread, NULL, process_socket, &client) != 0)
             printf("Error while creating new thread\n");
